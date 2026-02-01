@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 import re
 import requests
 
@@ -31,8 +31,7 @@ PHONE_PATTERN = re.compile(r"\b\d{10}\b")
 
 # ================= MODELS =================
 
-class Message(BaseModel):
-    # ⚠️ sender is OPTIONAL for Round-1 validator
+class MessageObject(BaseModel):
     sender: Optional[str] = "scammer"
     text: str
     timestamp: Optional[str] = None
@@ -40,31 +39,35 @@ class Message(BaseModel):
 
 class RequestBody(BaseModel):
     sessionId: str
-    message: Message
-    conversationHistory: Optional[List[Message]] = None
+    # 🔥 CRITICAL FIX: message can be STRING or OBJECT
+    message: Union[str, MessageObject]
+    conversationHistory: Optional[list] = None
     metadata: Optional[dict] = None
+
+# ================= HELPERS =================
+
+def normalize_message(msg: Union[str, MessageObject]) -> tuple[str, str]:
+    """
+    Returns (sender, text)
+    """
+    if isinstance(msg, str):
+        return "scammer", msg
+    return msg.sender or "scammer", msg.text
 
 # ================= SCAM DETECTION =================
 
 def detect_scam(text: str) -> bool:
-    text_lower = text.lower()
-
-    if any(keyword in text_lower for keyword in SCAM_KEYWORDS):
-        return True
-
-    if LINK_PATTERN.search(text):
-        return True
-
-    if UPI_PATTERN.search(text) or PHONE_PATTERN.search(text):
-        return True
-
-    return False
+    text = text.lower()
+    return (
+        any(k in text for k in SCAM_KEYWORDS)
+        or LINK_PATTERN.search(text)
+        or UPI_PATTERN.search(text)
+        or PHONE_PATTERN.search(text)
+    )
 
 # ================= INTELLIGENCE EXTRACTION =================
 
 def extract_intelligence(text: str, session_data: dict):
-    text_lower = text.lower()
-
     for upi in UPI_PATTERN.findall(text):
         session_data["intelligence"]["upiIds"].add(upi)
 
@@ -74,53 +77,46 @@ def extract_intelligence(text: str, session_data: dict):
     if LINK_PATTERN.search(text):
         session_data["intelligence"]["phishingLinks"].add(text)
 
-    for keyword in SCAM_KEYWORDS:
-        if keyword in text_lower:
-            session_data["intelligence"]["suspiciousKeywords"].add(keyword)
+    for kw in SCAM_KEYWORDS:
+        if kw in text.lower():
+            session_data["intelligence"]["suspiciousKeywords"].add(kw)
 
-# ================= REPLY STRATEGY =================
+# ================= REPLY LOGIC =================
 
-def generate_reply(session_data: dict, current_text: str) -> str:
-    text = current_text.lower()
+def generate_reply(session_data: dict, text: str) -> str:
+    text = text.lower()
 
     if not session_data["scam_detected"]:
         return "Okay, could you please explain a bit more?"
 
-    if "bank" not in text and not any(
-        "bank" in msg["text"].lower()
-        for msg in session_data["messages"]
-        if msg["sender"] == "scammer"
-    ):
+    if "bank" not in text:
         return "Which bank is this regarding?"
 
-    if any(word in text for word in ["upi", "otp", "payment"]):
+    if any(w in text for w in ["upi", "otp", "payment"]):
         return "Why do you need this information right now?"
 
     if LINK_PATTERN.search(text):
-        return "I’m not able to open links right now. What exactly does it say?"
+        return "I’m unable to open links right now. What does it say?"
 
-    return "I’m a bit confused. Can you explain the process step by step?"
+    return "I’m a bit confused. Can you explain the steps clearly?"
 
-# ================= FINAL CALLBACK HELPERS =================
+# ================= FINAL CALLBACK =================
 
 def should_finalize(session_data: dict) -> bool:
     if not session_data["scam_detected"]:
         return False
-
-    if session_data["message_count"] >= 6:
-        return True
-
     intel = session_data["intelligence"]
-    if intel["upiIds"] or intel["phishingLinks"]:
-        return True
+    return (
+        session_data["message_count"] >= 5
+        or intel["upiIds"]
+        or intel["phishingLinks"]
+    )
 
-    return False
 
-
-def build_final_payload(session_id: str, session_data: dict) -> dict:
+def send_final_callback(session_id: str, session_data: dict):
     intel = session_data["intelligence"]
 
-    return {
+    payload = {
         "sessionId": session_id,
         "scamDetected": True,
         "totalMessagesExchanged": session_data["message_count"],
@@ -131,11 +127,9 @@ def build_final_payload(session_id: str, session_data: dict) -> dict:
             "phoneNumbers": list(intel["phoneNumbers"]),
             "suspiciousKeywords": list(intel["suspiciousKeywords"])
         },
-        "agentNotes": "Rule-based detection with autonomous engagement"
+        "agentNotes": "Rule-based scam detection with autonomous engagement"
     }
 
-
-def send_final_callback(payload: dict):
     try:
         requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
     except Exception:
@@ -144,23 +138,21 @@ def send_final_callback(payload: dict):
 # ================= API ENDPOINT =================
 
 @app.post("/honeypot")
-def honeypot_endpoint(
+def honeypot(
     body: RequestBody,
     x_api_key: str = Header(None)
 ):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    sender, text = normalize_message(body.message)
     session_id = body.sessionId
-    incoming_text = body.message.text
-    sender = body.message.sender or "scammer"
 
-    # Initialize session
     if session_id not in SESSION_STORE:
         SESSION_STORE[session_id] = {
             "messages": [],
-            "scam_detected": False,
             "message_count": 0,
+            "scam_detected": False,
             "finalized": False,
             "intelligence": {
                 "upiIds": set(),
@@ -170,38 +162,21 @@ def honeypot_endpoint(
             }
         }
 
-    session_data = SESSION_STORE[session_id]
+    session = SESSION_STORE[session_id]
+    session["message_count"] += 1
 
-    # Store incoming message
-    session_data["messages"].append({
-        "sender": sender,
-        "text": incoming_text
-    })
-    session_data["message_count"] += 1
+    extract_intelligence(text, session)
 
-    # Extract intelligence
-    extract_intelligence(incoming_text, session_data)
+    if detect_scam(text):
+        session["scam_detected"] = True
 
-    # Scam detection
-    if detect_scam(incoming_text):
-        session_data["scam_detected"] = True
+    reply = generate_reply(session, text)
 
-    # Generate reply
-    reply_text = generate_reply(session_data, incoming_text)
-
-    # Store agent reply
-    session_data["messages"].append({
-        "sender": "agent",
-        "text": reply_text
-    })
-
-    # Final callback (only once)
-    if not session_data["finalized"] and should_finalize(session_data):
-        payload = build_final_payload(session_id, session_data)
-        send_final_callback(payload)
-        session_data["finalized"] = True
+    if not session["finalized"] and should_finalize(session):
+        send_final_callback(session_id, session)
+        session["finalized"] = True
 
     return {
         "status": "success",
-        "reply": reply_text
+        "reply": reply
     }
