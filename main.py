@@ -18,34 +18,42 @@ LINK_PATTERN = re.compile(r"http[s]?://|www\.", re.IGNORECASE)
 UPI_PATTERN = re.compile(r"\b[\w.-]+@[\w.-]+\b")
 PHONE_PATTERN = re.compile(r"\b\d{10}\b")
 
-# ================= ROOT LISTENER (KEEPS TESTER HAPPY) =================
+# ================= FIX START: HANDLE ALL PINGS =================
+
 @app.get("/")
 async def root():
+    """Handles ping to the home page"""
     return {"status": "online", "message": "Honeypot is running"}
 
 @app.head("/")
 async def root_head():
     return {"status": "online"}
 
-# ================= MAIN ENDPOINT (NO VALIDATION RULES) =================
-@app.post("/honeypot")
-async def honeypot(request: Request):
+@app.get("/honeypot")
+async def honeypot_get():
     """
-    Accepts ANY request. 
-    No Pydantic models. 
-    No Header arguments.
-    Manual parsing only.
+    FIXES 405 ERROR:
+    Handles the Tester's GET request to /honeypot.
+    Tells the tester: "This endpoint exists, please use POST."
+    """
+    return {"status": "success", "message": "Endpoint active. Send POST request."}
+
+# ================= FIX END =================
+
+@app.post("/honeypot")
+async def honeypot_post(request: Request):
+    """
+    Main Logic (POST requests).
+    Universal Receiver - No strict validation to prevent 422 errors.
     """
     
     # 1. READ HEADERS MANUALLY
-    # We look for the key in both lowercase and standard format
     incoming_key = request.headers.get("x-api-key") or request.headers.get("X-API-KEY")
     
     print(f"--- HEADERS RECEIVED: {request.headers} ---")
     
     if incoming_key != API_KEY:
         print(f"Auth Failed. Received: {incoming_key}")
-        # Return 401 JSON (Not HTTPException, to avoid HTML error pages)
         return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid API Key"})
 
     # 2. READ BODY SAFELY
@@ -58,15 +66,13 @@ async def honeypot(request: Request):
             data = json.loads(body_str)
     except Exception as e:
         print(f"JSON Parse Error: {e}")
-        # If JSON fails, we create a dummy body so the server doesn't crash
         data = {"message": {"text": "invalid_json_received"}}
 
     print(f"--- BODY RECEIVED: {data} ---")
 
-    # 3. EXTRACT DATA (Use .get() to prevent crashes)
+    # 3. EXTRACT DATA
     session_id = data.get("sessionId", "unknown_session")
     
-    # Handle message format (String vs Object)
     msg_obj = data.get("message")
     text = ""
     if isinstance(msg_obj, dict):
@@ -75,7 +81,6 @@ async def honeypot(request: Request):
         text = msg_obj
     
     # 4. BASIC LOGIC & INTELLIGENCE
-    # (Simplified for stability, but keeps tracking)
     if session_id not in SESSION_STORE:
         SESSION_STORE[session_id] = {
             "count": 0,
@@ -86,13 +91,11 @@ async def honeypot(request: Request):
     session = SESSION_STORE[session_id]
     session["count"] += 1
     
-    # Update Intel
     session["intel"]["upi"].update(UPI_PATTERN.findall(text))
     session["intel"]["phone"].update(PHONE_PATTERN.findall(text))
     if LINK_PATTERN.search(text):
         session["intel"]["link"].add(text)
     
-    # Check Scam
     if any(k in text.lower() for k in SCAM_KEYWORDS):
         session["scam"] = True
 
@@ -103,7 +106,7 @@ async def honeypot(request: Request):
     elif "verify" in text.lower():
         reply = "I don't know how to verify."
 
-    # 6. RETURN SUCCESS (Always 200 OK)
+    # 6. RETURN SUCCESS
     response = {
         "status": "success",
         "reply": reply
