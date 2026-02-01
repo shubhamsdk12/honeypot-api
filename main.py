@@ -34,7 +34,6 @@ PHONE_PATTERN = re.compile(r"\b\d{10}\b")
 def normalize_message(raw_msg) -> tuple[str, str]:
     """
     Robust normalizer that handles String, Dict, or None without crashing.
-    Returns (sender, text)
     """
     if isinstance(raw_msg, str):
         return "scammer", raw_msg
@@ -60,9 +59,8 @@ def extract_intelligence(text: str, session_data: dict):
     for phone in PHONE_PATTERN.findall(text):
         session_data["intelligence"]["phoneNumbers"].add(phone)
 
-    # Extract Links (Improved Regex usage)
+    # Extract Links
     if LINK_PATTERN.search(text):
-        # We capture the whole text as the link context if a pattern matches
         session_data["intelligence"]["phishingLinks"].add(text)
 
     # Extract Keywords
@@ -95,10 +93,7 @@ def should_finalize(session_data: dict) -> bool:
     intel = session_data["intelligence"]
     
     # Finalize if we have extracted CRITICAL intel or conversation is long
-    has_critical_intel = (len(intel["upiIds"]) > 0 or len(intel["phishingLinks"]) > 0)
-    is_long_convo = session_data["message_count"] >= 5
-    
-    return has_critical_intel or is_long_convo
+    return (len(intel["upiIds"]) > 0 or len(intel["phishingLinks"]) > 0 or session_data["message_count"] >= 5)
 
 def send_final_callback(session_id: str, session_data: dict):
     intel = session_data["intelligence"]
@@ -109,7 +104,7 @@ def send_final_callback(session_id: str, session_data: dict):
         "totalMessagesExchanged": session_data["message_count"],
         "extractedIntelligence": {
             "bankAccounts": [],
-            "upiIds": list(intel["upiIds"]), # Convert Set to List
+            "upiIds": list(intel["upiIds"]),
             "phishingLinks": list(intel["phishingLinks"]),
             "phoneNumbers": list(intel["phoneNumbers"]),
             "suspiciousKeywords": list(intel["suspiciousKeywords"])
@@ -117,36 +112,40 @@ def send_final_callback(session_id: str, session_data: dict):
         "agentNotes": "Rule-based scam detection with autonomous engagement"
     }
 
-    print(f"--- TRIGGERING CALLBACK FOR {session_id} ---")
     try:
-        response = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
-        print(f"Callback Status: {response.status_code}")
+        requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
     except Exception as e:
         print(f"Callback Failed: {e}")
 
-# ================= API ENDPOINT (NO PYDANTIC) =================
+# ================= API ENDPOINTS =================
+
+# --- FIX START: This is what you were missing! ---
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Honeypot is running"}
+
+@app.head("/")
+async def root_head():
+    return {"status": "online"}
+# --- FIX END ---
 
 @app.post("/honeypot")
 async def honeypot(request: Request, x_api_key: str = Header(None)):
     """
-    1. Authenticates
-    2. Parses raw JSON (No 422 Errors)
-    3. Runs Intelligence Extraction
-    4. Detects Scam
-    5. Replies & Callbacks
+    Handles the main logic safely.
     """
     
     # 1. Auth Check
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # 2. Parse Body Safely
+    # 2. Parse Body Safely (No Pydantic Crash)
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 3. Extract Fields (Using .get to avoid crashes)
+    # 3. Extract Fields
     session_id = body.get("sessionId", "unknown_session")
     raw_message = body.get("message")
     
@@ -179,7 +178,7 @@ async def honeypot(request: Request, x_api_key: str = Header(None)):
     # 6. Generate Reply
     reply = generate_reply(session, text)
 
-    # 7. Handle Callback (if criteria met)
+    # 7. Handle Callback
     if not session["finalized"] and should_finalize(session):
         send_final_callback(session_id, session)
         session["finalized"] = True
