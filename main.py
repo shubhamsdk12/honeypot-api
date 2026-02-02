@@ -1,74 +1,76 @@
-import uvicorn
-import json
+from fastapi import FastAPI, Header, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import re
 import requests
-import random
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
-from typing import Dict, Any, Set
+import uvicorn
 
 # ================= CONFIGURATION =================
-API_KEY = "helloworld123"
+# REQ: Secures access using an API key
+API_KEY = "helloworld123"  # Replace with a secure key in production
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# ================= STATE MANAGEMENT =================
-sessions: Dict[str, Any] = {}
+# ================= IN-MEMORY STORAGE =================
+# REQ: Handle multi-turn conversations
+sessions = {}
 
-# ================= PATTERNS & SCRIPTS =================
+# ================= REGEX & PATTERNS =================
+# REQ: Extract scam-related intelligence
 PATTERNS = {
     "upi": re.compile(r'[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{3,}'),
-    "phone": re.compile(r'\b[6-9]\d{9}\b'),
+    "phone": re.compile(r'\b[6-9]\d{9}\b'), # Basic Indian mobile pattern
     "link": re.compile(r'http[s]?://[^\s]+'),
     "bank": re.compile(r'\b\d{9,18}\b')
 }
 
-SCAM_KEYWORDS = ["urgent", "verify", "block", "suspend", "kyc", "expire", "pan", "aadhar", "account"]
+SCAM_KEYWORDS = ["urgent", "verify", "block", "suspend", "kyc", "expire", "pan", "aadhar", "account", "otp"]
 
-# Scripted Persona (The "Martha" Fallback)
-RESPONSES = [
-    "I am not very good with technology. What do I need to do?",
-    "My grandson usually handles this. Can you explain slowly?",
-    "Oh dear, I don't want my account blocked. How do I fix it?",
-    "I can't find my glasses. Which number should I read?",
-    "Is this going to cost money? I am on a pension."
-]
+# ================= PYDANTIC MODELS (STRICT PDF COMPLIANCE) =================
+class IncomingMessage(BaseModel):
+    sender: str
+    text: str
+    timestamp: Optional[str] = None
 
-app = FastAPI()
+class HoneypotRequest(BaseModel):
+    sessionId: str
+    message: IncomingMessage
+    conversationHistory: Optional[List[Dict[str, Any]]] = []
+    metadata: Optional[Dict[str, Any]] = None
 
 # ================= HELPER FUNCTIONS =================
 
-def extract_intel(text: str, session: dict):
-    """
-    Extracts regex patterns and updates the session intel.
-    """
+def extract_intelligence(text: str, session: dict):
+    """Extracts regex patterns and updates the session intel."""
     text_lower = text.lower()
     
-    # 1. Regex Extraction
+    # Extract entities
     session["intel"]["upi"].update(PATTERNS["upi"].findall(text))
     session["intel"]["phone"].update(PATTERNS["phone"].findall(text))
     session["intel"]["links"].update(PATTERNS["link"].findall(text))
     session["intel"]["accounts"].update(PATTERNS["bank"].findall(text))
     
-    # 2. Keyword Scoring
+    # Check keywords for scoring
     for word in SCAM_KEYWORDS:
         if word in text_lower:
             session["intel"]["keywords"].add(word)
             session["scam_score"] += 1
 
-def send_callback_background(session_id: str, session: dict):
+def send_guvi_callback(session_id: str, session: dict):
     """
-    Runs in BACKGROUND. Sends data to GUVI without blocking the reply.
+    REQ: Mandatory Final Result Callback
+    Sends data to GUVI. This runs in the background.
     """
-    if session["finalized"]:
+    # Only send if we haven't already finalized this session
+    if session.get("finalized"):
         return
 
-    # Trigger Logic: High Score OR Sensitive Data Found OR Long Conversation
-    has_data = len(session["intel"]["upi"]) > 0 or len(session["intel"]["links"]) > 0
-    high_score = session["scam_score"] >= 2
-    long_convo = session["turns"] >= 5
+    # Trigger Logic: Send if we found sensitive data OR conversation is long enough
+    has_data = len(session["intel"]["upi"]) > 0 or len(session["intel"]["links"]) > 0 or len(session["intel"]["accounts"]) > 0
+    is_scam_likely = session["scam_score"] >= 2
+    is_long_convo = session["turns"] >= 5
 
-    if has_data or high_score or long_convo:
-        # Match the PDF Schema EXACTLY
+    if has_data or is_scam_likely or is_long_convo:
+        # Prepare payload exactly as per PDF Page 13-14
         payload = {
             "sessionId": session_id,
             "scamDetected": True,
@@ -80,59 +82,44 @@ def send_callback_background(session_id: str, session: dict):
                 "phoneNumbers": list(session["intel"]["phone"]),
                 "suspiciousKeywords": list(session["intel"]["keywords"])
             },
-            "agentNotes": "Rule-based Agent detected urgency and extracted payment details."
+            "agentNotes": "Scam intent detected. Extracted intelligence via automated agent."
         }
         
         try:
-            print(f"🚀 [BACKGROUND] Sending Callback for {session_id}...")
-            requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+            print(f"🚀 Sending Callback for {session_id}...")
+            response = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+            print(f"✅ Callback Status: {response.status_code}")
             session["finalized"] = True
-            print("✅ Callback Sent Successfully")
         except Exception as e:
             print(f"❌ Callback Failed: {e}")
 
 # ================= API ENDPOINTS =================
 
+app = FastAPI()
+
 @app.get("/")
-async def root():
+def root():
+    """Fixes the 404 error by handling the tester's connectivity probe."""
     return {"status": "online", "message": "Honeypot Active"}
 
-@app.head("/")
-async def root_head():
-    return {"status": "online"}
-
-@app.get("/honeypot")
-async def honeypot_get():
-    return {"status": "online", "message": "Send POST request to this endpoint"}
+@app.get("/health")
+def health():
+    """Optional health check for Render."""
+    return {"status": "healthy"}
 
 @app.post("/honeypot")
-async def honeypot(request: Request, background_tasks: BackgroundTasks):
+def honeypot(data: HoneypotRequest, background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
     """
-    1. Accepts Request (Crash-Proof)
-    2. Runs Logic
-    3. Queues Callback
-    4. Returns JSON Schema Match
+    REQ: Main API Endpoint
     """
-    
     # 1. Auth Check
-    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-KEY")
-    if api_key != API_KEY:
-        return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid API Key"})
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # 2. Parse Body safely
-    try:
-        raw = await request.body()
-        data = json.loads(raw) if raw else {}
-    except:
-        data = {}
+    session_id = data.sessionId
+    text = data.message.text
 
-    # 3. Session Setup
-    session_id = data.get("sessionId", "unknown")
-    
-    # Extract 'text' from message object or string
-    msg_raw = data.get("message", "")
-    text = msg_raw.get("text", "") if isinstance(msg_raw, dict) else str(msg_raw)
-
+    # 2. Session Management
     if session_id not in sessions:
         sessions[session_id] = {
             "turns": 0,
@@ -146,25 +133,32 @@ async def honeypot(request: Request, background_tasks: BackgroundTasks):
     
     session = sessions[session_id]
     session["turns"] += 1
-    
-    # 4. Intelligence Logic
-    extract_intel(text, session)
-    
-    # 5. Generate Reply (Scripted Random Choice)
-    reply = random.choice(RESPONSES)
+
+    # 3. Intelligence Extraction
+    extract_intelligence(text, session)
+
+    # 4. Agent Persona (Basic Scripted - Upgrade this to AI later)
+    # REQ: Maintain a believable human-like persona
+    reply = "I am a bit confused. Can you explain that again?"
     if "bank" in text.lower():
-        reply = "Which bank account is this regarding? I have two."
+        reply = "Which bank account is this regarding? I have an account with SBI."
     elif "verify" in text.lower():
-        reply = "How do I verify? Do I need to click something?"
+        reply = "I don't know how to do that. Is it difficult?"
+    elif "urgent" in text.lower():
+        reply = "Please don't rush me, I get nervous."
 
-    # 6. Schedule Callback (Does NOT block response)
-    background_tasks.add_task(send_callback_background, session_id, session)
+    # 5. Schedule Callback (Critical: Run in background to keep API fast)
+    background_tasks.add_task(send_guvi_callback, session_id, session)
 
-    # 7. Return Response (Matches PDF Schema)
+    # 6. Response
+    # REQ: Return structured JSON response
     return {
         "status": "success",
         "reply": reply
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Render uses the PORT environment variable
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
