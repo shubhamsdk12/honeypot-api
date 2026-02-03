@@ -1,4 +1,25 @@
-# Python cache
+# Security (Crucial for main.py configuration)
+.env
+.env.local
+
+# Python Compiled Files (Seen in your upload)
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+
+# Virtual Environments (Standard for requirements.txt projects)
+venv/
+.venv/
+env/
+.env/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Distribution / Build
+build/
+dist/
+*.egg-info/
