@@ -121,7 +121,7 @@ class IncomingMessage(BaseModel):
     """Incoming message structure from scammer"""
     sender: str
     text: str
-    timestamp: str
+    timestamp: str | int  # <--- Allow string OR integer
 
 class MessageRequest(BaseModel):
     """Validated message request with security constraints"""
