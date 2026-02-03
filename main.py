@@ -1,78 +1,66 @@
 from fastapi import FastAPI, Header, HTTPException
-from typing import List, Optional, Union
-from pydantic import BaseModel
+from typing import Optional, List, Any
+from pydantic import BaseModel, ConfigDict
 
 app = FastAPI()
 
-# ================= CONFIG =================
 API_KEY = "shriRAM"
-# =========================================
 
 
-# ---------- MODELS ----------
+# ---------- MODELS (LENIENT) ----------
+
 class Message(BaseModel):
-    sender: str
-    text: str
-    timestamp: Union[int, str]   # ACCEPT BOTH
+    sender: Optional[str] = None
+    text: Optional[str] = None
+    timestamp: Optional[Any] = None
 
-
-class HistoryItem(BaseModel):
-    sender: str
-    text: str
-    timestamp: Union[int, str]
-
-
-class Metadata(BaseModel):
-    channel: Optional[str] = None
-    language: Optional[str] = None
-    locale: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
 
 
 class HoneypotRequest(BaseModel):
-    sessionId: str
-    message: Message
-    conversationHistory: Optional[List[HistoryItem]] = []
-    metadata: Optional[Metadata] = None
+    sessionId: Optional[str] = None
+    message: Optional[Message] = None
+    conversationHistory: Optional[Any] = None
+    metadata: Optional[Any] = None
+
+    model_config = ConfigDict(extra="allow")
 
 
 # ---------- LOGIC ----------
-def detect_scam(text: str) -> bool:
-    keywords = [
-        "blocked",
-        "verify",
-        "upi",
-        "account",
-        "suspended",
-        "urgent",
-        "immediately"
-    ]
+
+def detect_scam(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    keywords = ["blocked", "verify", "upi", "account", "urgent"]
     text = text.lower()
-    return any(word in text for word in keywords)
-
-
-def agent_reply() -> str:
-    return "Why will my account be blocked?"
+    return any(k in text for k in keywords)
 
 
 # ---------- ENDPOINT ----------
+
 @app.post("/")
 def honeypot(
     body: HoneypotRequest,
-    x_api_key: str = Header(None)
+    x_api_key: Optional[str] = Header(None)
 ):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    scam = detect_scam(body.message.text)
+    text = body.message.text if body.message else ""
 
-    # 🔥 ROUND-1 SAFE RESPONSE
-    if scam:
+    if detect_scam(text):
         return {
             "status": "success",
-            "reply": agent_reply()
+            "reply": "Why will my account be blocked?"
         }
 
     return {
         "status": "success",
         "reply": "Okay."
     }
+
+
+# OPTIONAL: health check (not required)
+@app.get("/")
+def health():
+    return {"status": "ok"}
